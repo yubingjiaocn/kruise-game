@@ -126,6 +126,21 @@ TargetGroupBinding的CRD及控制器：https://github.com/kubernetes-sigs/aws-lo
 - 填写格式：key1:value1,key2:value2...
 - 是否支持变更：是
 
+#### AGALabelSelector
+- 含义：用于挑选前置该 NLB 的 `GlobalAccelerator` CR 的 label selector。留空时 AGA 集成关闭，插件行为与原先完全一致；填写时 GameServer 的 `network-status.externalAddresses[].ip` 将被填入 AGA 的静态 anycast IP。详见下方 [Global Accelerator (AGA) 集成](#global-accelerator-aga-集成) 小节。
+- 填写格式：标准 Kubernetes label selector 字符串。例如：`game.kruise.io/aga-pool=poc-test` 或 `app=game,tier=prod`
+- 是否支持变更：是
+
+#### AGAClientIPPreservation
+- 含义：当 AGA 追加 per-port listener 时（详见 [AGA 集成](#global-accelerator-aga-集成)），设置 endpoint 上的 `clientIPPreservationEnabled`。注意：AGA 仅在 NLB 挂有 security group 时才能保留客户端 IP。
+- 填写格式：`true` / `false`（默认 `false`）
+- 是否支持变更：是
+
+#### AGANamespace
+- 含义：查找 AGA CR 的 namespace。不填则默认与 pod 同 namespace。
+- 填写格式：字符串。例如：`okg-aga-poc`
+- 是否支持变更：是
+
 
 ### 使用示例
 ```shell
@@ -181,3 +196,82 @@ networkStatus:
     lastTransitionTime: "2024-05-30T03:34:14Z"
     networkType: AmazonWebServices-NLB
 ```
+## Global Accelerator (AGA) 集成
+
+对延迟敏感的游戏、以及只能白名单极少量固定 IP 的客户端，AmazonWebServices-NLB 插件可选用 [AWS Global Accelerator](https://aws.amazon.com/global-accelerator/) 前置每个 pod 的 NLB，让玩家通过 AGA 的静态 anycast IP 和 AWS 骨干网接入游戏服。AGA 的静态 IP 会写入 GameServer 的 `network-status.externalAddresses[].ip` 字段，pod 通过常规的 DownwardAPI 流程即可读到（NLB DNS 仍然保留在 `endPoint`）。
+
+AGA 集成完全 opt-in。`AGALabelSelector` 留空时不会进入任何 AGA 代码路径，纯 NLB 行为与之前一致，逐字节不变。
+
+### 准备工作
+
+AGA 集成依赖 [AWS Global Accelerator Kubernetes Controller](https://github.com/aws-controllers-k8s/globalaccelerator-controller)，提供 `GlobalAccelerator` CR（`apiVersion: aga.k8s.aws/v1alpha1`）。安装方式与上文 elbv2-controller 相同的 IRSA 模式：通过集群 OIDC provider 把控制器的 ServiceAccount 绑定到具备 AGA 管理权限（通常是 `GlobalAcceleratorFullAccess`）的 IAM role。
+
+OKG 控制器自身需要 AGA CR 的 RBAC（`aga.k8s.aws/globalaccelerators` 上的 `get;list;watch;patch`）；包含 AGA 支持的 OKG 版本通过 `make deploy` 安装时会自动包含此权限。
+
+### 两种工作模式（自动选择）
+
+插件会根据 AGA CR 上现有的 listener 自动为每个 pod 选择模式：
+
+1. **预置模式（生产推荐）。** AGA 上已经有一段宽端口范围的 listener（如端口 `32001-32050`）指向该 NLB。插件检测到分配到的端口已被覆盖，仅记录 assignment 并把 IP 读回 GameServer 状态，**不**修改 AGA CR。这绕开了 AGA webhook 对同协议端口范围重叠的拦截，也是单个 AGA 能扩到几十个以上 GameServer 的唯一可行模式。
+2. **逐端口模式。** AGA 没有覆盖分配到的端口。插件用 JSON Patch（`op: add, path: /spec/listeners/-`）追加 per-port listener；pod 删除时按内容匹配（NLB ARN + 精确端口）移除对应 listener，而非按固定下标，避免并发删除时误删别的 listener。
+
+### 状态回传
+
+插件会启动一个针对 `GlobalAccelerator` CR 的 informer。当关联的 AGA 拿到分配的 IP 时（注意：AWS 在 accelerator 还处于 `IN_PROGRESS` 状态时就已经分配 anycast IP，不必等到 `DEPLOYED`），插件会主动 reconcile 所有使用该 AGA 的 GameServer，而不是等下一次 pod 事件触发。
+
+若集群里没有安装 `aga.k8s.aws` CRD，AGA watcher 会在启动时打印一条 warning，NLB 插件其余功能照常工作。
+
+### 使用示例（预置模式）
+
+最简单的搭建方式是预置模式：每个池子建一个 `GlobalAccelerator` CR，listener 的端口范围覆盖该 NLB 的 `min_port`-`max_port`，打上 label，从 GameServerSet 引用即可。
+
+```shell
+cat <<EOF | kubectl apply -f -
+apiVersion: game.kruise.io/v1alpha1
+kind: GameServerSet
+metadata:
+  name: gs-demo
+  namespace: default
+spec:
+  replicas: 1
+  updateStrategy:
+    rollingUpdate:
+      podUpdatePolicy: InPlaceIfPossible
+  network:
+    networkType: AmazonWebServices-NLB
+    networkConf:
+    - name: NlbARNs
+      value: "arn:aws:elasticloadbalancing:us-east-1:xxxxxxxxxxxx:loadbalancer/net/okg-test/yyyyyyyyyyyyyyyy"
+    - name: NlbVPCId
+      value: "vpc-0bbc9f9f0ffexxxxx"
+    - name: PortProtocols
+      value: "80/TCP"
+    - name: AGALabelSelector
+      value: "game.kruise.io/aga-pool=poc-test"
+    - name: AGANamespace
+      value: "okg-aga-poc"
+  gameServerTemplate:
+    spec:
+      containers:
+        - image: registry.cn-hangzhou.aliyuncs.com/gs-demo/gameserver:network
+          name: gameserver
+EOF
+```
+
+最终的 GameServer 状态里同时挂有 NLB DNS（`endPoint`）和 AGA 静态 anycast IP（逗号分隔写入 `ip`）：
+
+```yaml
+networkStatus:
+    currentNetworkState: Ready
+    desiredNetworkState: Ready
+    externalAddresses:
+    - endPoint: okg-test-yyyyyyyyyyyyyyyy.elb.us-east-1.amazonaws.com
+      ip: "166.117.44.192,166.117.129.28"
+      ports:
+      - name: "80"
+        port: 32034
+        protocol: TCP
+    networkType: AmazonWebServices-NLB
+```
+
+pod 通过 DownwardAPI 即可读到这些 AGA IP，与读取 `network-status` 其他字段方式一致。

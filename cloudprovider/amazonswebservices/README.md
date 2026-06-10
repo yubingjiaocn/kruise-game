@@ -127,6 +127,21 @@ Official deployment documentation: https://docs.aws.amazon.com/eks/latest/usergu
 - Format: key1:value1,key2:value2...
 - Support for change: Yes
 
+#### AGALabelSelector
+- Meaning: Label selector that picks the target `GlobalAccelerator` CR to front this NLB. When empty, the AGA integration is disabled and the plugin behaves exactly as before. When set, the GameServer's `network-status.externalAddresses[].ip` will be filled with the AGA's static anycast IPs. See the [Global Accelerator (AGA) Integration](#global-accelerator-aga-integration) section below for details.
+- Format: standard Kubernetes label selector string. For example: `game.kruise.io/aga-pool=poc-test` or `app=game,tier=prod`
+- Support for change: Yes
+
+#### AGAClientIPPreservation
+- Meaning: Sets `clientIPPreservationEnabled` on the per-port endpoint that AGA forwards to. Only relevant when AGA appends a per-port listener (see [AGA Integration](#global-accelerator-aga-integration)). Note: AGA can only preserve the client IP when the NLB has a security group attached.
+- Format: `true` / `false` (default: `false`)
+- Support for change: Yes
+
+#### AGANamespace
+- Meaning: Namespace in which to look up the AGA CR. Defaults to the pod's namespace if unset.
+- Format: String. For example: `okg-aga-poc`
+- Support for change: Yes
+
 
 ### Usage Example
 ```shell
@@ -183,3 +198,82 @@ networkStatus:
     lastTransitionTime: "2024-05-30T03:34:14Z"
     networkType: AmazonWebServices-NLB
 ```
+## Global Accelerator (AGA) Integration
+
+For latency-sensitive games and clients that can only whitelist a small fixed set of IPs, the AmazonWebServices-NLB plugin can optionally front the per-pod NLB with [AWS Global Accelerator](https://aws.amazon.com/global-accelerator/) so that players reach the GameServer through AGA's static anycast IPs and the AWS backbone. The AGA static IPs are written into the GameServer's `network-status.externalAddresses[].ip` field, which the pod can read through the standard DownwardAPI flow alongside the NLB DNS name in `endPoint`.
+
+The AGA integration is fully opt-in. With `AGALabelSelector` empty, the AGA code path is never entered and the plugin's pure-NLB behavior is byte-for-byte unchanged.
+
+### Preparation
+
+The AGA integration relies on the [AWS Global Accelerator Kubernetes Controller](https://github.com/aws-controllers-k8s/globalaccelerator-controller), which provides the `GlobalAccelerator` CR (`apiVersion: aga.k8s.aws/v1alpha1`). Install it with the same IRSA pattern used for the elbv2-controller above: bind the controller's ServiceAccount to an IAM role that has the AGA management permissions (typically `GlobalAcceleratorFullAccess`) via the cluster's OIDC provider.
+
+The OKG controller itself needs RBAC for the AGA CR (`get;list;watch;patch` on `aga.k8s.aws/globalaccelerators`); this is included automatically when you install OKG via `make deploy` from a release that ships AGA support.
+
+### Two operating modes (auto-selected)
+
+The plugin chooses the mode automatically per pod based on the AGA CR's existing listeners:
+
+1. **Pre-provisioned mode (recommended for production).** The AGA already has a wide-range listener (e.g. ports `32001-32050`) pointing at the NLB. The plugin detects that the assigned port is already covered, records the assignment, and just reads the IPs back into the GameServer status -- it does **not** mutate the AGA CR. This avoids AGA's webhook rejection of overlapping port ranges for the same protocol, and is the only mode that scales beyond a few dozen GameServers per AGA.
+2. **Per-port mode.** The AGA does not cover the assigned port. The plugin appends a per-port listener via a JSON Patch (`op: add, path: /spec/listeners/-`). On pod deletion, the matching listener is removed by content match (NLB ARN + exact port), not by fixed index, so concurrent pod churn cannot accidentally remove someone else's listener.
+
+### Status propagation
+
+The plugin starts an informer on `GlobalAccelerator` CRs. When an associated AGA gets its IPs assigned (note: AWS allocates the anycast IPs while the accelerator is still in the `IN_PROGRESS` state, not only at `DEPLOYED`), the plugin proactively reconciles all GameServers using that AGA, instead of waiting for the next pod event.
+
+If the `aga.k8s.aws` CRD is not installed in the cluster, the AGA watcher logs a warning at startup and the rest of the NLB plugin keeps working normally.
+
+### Usage Example (pre-provisioned mode)
+
+The simplest setup is pre-provisioned: create one `GlobalAccelerator` CR per pool with a wide-range listener spanning the NLB's `min_port`-`max_port` range, label it, and reference it from the GameServerSet.
+
+```shell
+cat <<EOF | kubectl apply -f -
+apiVersion: game.kruise.io/v1alpha1
+kind: GameServerSet
+metadata:
+  name: gs-demo
+  namespace: default
+spec:
+  replicas: 1
+  updateStrategy:
+    rollingUpdate:
+      podUpdatePolicy: InPlaceIfPossible
+  network:
+    networkType: AmazonWebServices-NLB
+    networkConf:
+    - name: NlbARNs
+      value: "arn:aws:elasticloadbalancing:us-east-1:xxxxxxxxxxxx:loadbalancer/net/okg-test/yyyyyyyyyyyyyyyy"
+    - name: NlbVPCId
+      value: "vpc-0bbc9f9f0ffexxxxx"
+    - name: PortProtocols
+      value: "80/TCP"
+    - name: AGALabelSelector
+      value: "game.kruise.io/aga-pool=poc-test"
+    - name: AGANamespace
+      value: "okg-aga-poc"
+  gameServerTemplate:
+    spec:
+      containers:
+        - image: registry.cn-hangzhou.aliyuncs.com/gs-demo/gameserver:network
+          name: gameserver
+EOF
+```
+
+The resulting GameServer status carries both the NLB DNS (in `endPoint`) and the AGA static anycast IPs (comma-separated, in `ip`):
+
+```yaml
+networkStatus:
+    currentNetworkState: Ready
+    desiredNetworkState: Ready
+    externalAddresses:
+    - endPoint: okg-test-yyyyyyyyyyyyyyyy.elb.us-east-1.amazonaws.com
+      ip: "166.117.44.192,166.117.129.28"
+      ports:
+      - name: "80"
+        port: 32034
+        protocol: TCP
+    networkType: AmazonWebServices-NLB
+```
+
+The pod can read these AGA IPs through DownwardAPI just like any other field of `network-status`.
