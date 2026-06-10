@@ -107,12 +107,15 @@ type healthCheck struct {
 }
 
 type nlbConfig struct {
-	loadBalancerARNs []string
-	healthCheck      *healthCheck
-	vpcID            string
-	backends         []*backend
-	isFixed          bool
-	annotations      map[string]string
+	loadBalancerARNs       []string
+	healthCheck            *healthCheck
+	vpcID                  string
+	backends               []*backend
+	isFixed                bool
+	annotations            map[string]string
+	agaLabelSelector       string
+	agaClientIPPreservation bool
+	agaNamespace           string
 }
 
 func startWatchTargetGroup(ctx context.Context) error {
@@ -201,6 +204,9 @@ func (n *NlbPlugin) Init(c client.Client, options cloudprovider.CloudProviderOpt
 	if err != nil {
 		return err
 	}
+	if err := startWatchAGA(ctx); err != nil {
+		log.Warningf("[AGA] failed to start AGA watcher (AGA CRD may not be installed): %v", err)
+	}
 	nlbOptions, ok := options.(provideroptions.AmazonsWebServicesOptions)
 	if !ok {
 		return cperrors.ToPluginError(fmt.Errorf("failed to convert options to nlbOptions"), cperrors.InternalError)
@@ -218,6 +224,9 @@ func (n *NlbPlugin) Init(c client.Client, options cloudprovider.CloudProviderOpt
 	if err != nil {
 		return err
 	}
+
+	rebuildAGACacheFromServices(ctx, c, svcList.Items)
+
 	log.Infof("[%s] podAllocate cache complete initialization: %s", NlbNetwork, pretty.Sprint(n.podAllocate))
 	return nil
 }
@@ -353,6 +362,8 @@ func (n *NlbPlugin) OnPodUpdated(c client.Client, pod *corev1.Pod, ctx context.C
 	// network ready
 	internalAddresses := make([]gamekruiseiov1alpha1.NetworkAddress, 0)
 	externalAddresses := make([]gamekruiseiov1alpha1.NetworkAddress, 0)
+	nlbARN := svc.Annotations[NlbARNAnnoKey]
+	var allocatedPorts []int32
 	for _, port := range svc.Spec.Ports {
 		instrIPort := port.TargetPort
 		instrEPort := intstr.FromInt(int(port.Port))
@@ -367,7 +378,7 @@ func (n *NlbPlugin) OnPodUpdated(c client.Client, pod *corev1.Pod, ctx context.C
 			},
 		}
 		externalAddress := gamekruiseiov1alpha1.NetworkAddress{
-			EndPoint: generateNlbEndpoint(svc.Annotations[NlbARNAnnoKey]),
+			EndPoint: generateNlbEndpoint(nlbARN),
 			Ports: []gamekruiseiov1alpha1.NetworkPort{
 				{
 					Name:     instrIPort.String(),
@@ -378,7 +389,23 @@ func (n *NlbPlugin) OnPodUpdated(c client.Client, pod *corev1.Pod, ctx context.C
 		}
 		internalAddresses = append(internalAddresses, internalAddress)
 		externalAddresses = append(externalAddresses, externalAddress)
+		allocatedPorts = append(allocatedPorts, port.Port)
 	}
+
+	// AGA integration: append listeners and override externalAddresses with AGA IPs
+	podKey := pod.GetNamespace() + "/" + pod.GetName()
+	if lbConfig.agaLabelSelector != "" {
+		if agaErr := reconcileAGAForPod(ctx, c, lbConfig, nlbARN, allocatedPorts, podKey); agaErr != nil {
+			log.Warningf("[AGA] reconcile failed for pod %s: %v (NLB path unaffected)", podKey, agaErr)
+		}
+		agaIPs := getAGAIPsForPod(ctx, c, lbConfig, podKey)
+		if len(agaIPs) > 0 {
+			for i := range externalAddresses {
+				externalAddresses[i].IP = strings.Join(agaIPs, ",")
+			}
+		}
+	}
+
 	networkStatus.InternalAddresses = internalAddresses
 	networkStatus.ExternalAddresses = externalAddresses
 	networkStatus.CurrentNetworkState = gamekruiseiov1alpha1.NetworkReady
@@ -425,6 +452,7 @@ func (n *NlbPlugin) OnPodDeleted(client client.Client, pod *corev1.Pod, ctx cont
 	}
 
 	for _, podKey := range podKeys {
+		cleanupAGAForPod(ctx, client, sc, podKey)
 		n.deAllocate(podKey)
 	}
 
@@ -513,6 +541,9 @@ func parseLbConfig(conf []gamekruiseiov1alpha1.NetworkConfParams) *nlbConfig {
 	var lbARNs []string
 	var hc healthCheck
 	var vpcId string
+	var agaLabelSelector string
+	var agaClientIPPreservation bool
+	var agaNamespace string
 	backends := make([]*backend, 0)
 	isFixed := false
 	annotations := map[string]string{}
@@ -605,15 +636,27 @@ func parseLbConfig(conf []gamekruiseiov1alpha1.NetworkConfParams) *nlbConfig {
 					log.Warningf("nlb %s %s is invalid", NlbAnnotations, c.Value)
 				}
 			}
+		case AGALabelSelectorConfigName:
+			agaLabelSelector = c.Value
+		case AGAClientIPPreservationConfigName:
+			v, err := strconv.ParseBool(c.Value)
+			if err == nil {
+				agaClientIPPreservation = v
+			}
+		case AGANamespaceConfigName:
+			agaNamespace = c.Value
 		}
 	}
 	return &nlbConfig{
-		loadBalancerARNs: lbARNs,
-		healthCheck:      &hc,
-		vpcID:            vpcId,
-		backends:         backends,
-		isFixed:          isFixed,
-		annotations:      annotations,
+		loadBalancerARNs:        lbARNs,
+		healthCheck:             &hc,
+		vpcID:                   vpcId,
+		backends:                backends,
+		isFixed:                 isFixed,
+		annotations:             annotations,
+		agaLabelSelector:        agaLabelSelector,
+		agaClientIPPreservation: agaClientIPPreservation,
+		agaNamespace:            agaNamespace,
 	}
 }
 
@@ -653,22 +696,24 @@ func (n *NlbPlugin) syncTargetGroupAndService(config *nlbConfig,
 		protocol := string(config.backends[i].protocol)
 		targetPort := int64(config.backends[i].targetPort)
 		var targetTypeIP = string(ackv1alpha1.TargetTypeEnum_ip)
-		_, err := controllerutil.CreateOrUpdate(ctx, client, &ackv1alpha1.TargetGroup{
+		tg := &ackv1alpha1.TargetGroup{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:            targetGroupName,
-				Namespace:       pod.GetNamespace(),
-				OwnerReferences: ownerReference,
-				Labels: map[string]string{
-					ResourceTagKey:           ResourceTagValue,
-					SvcSelectorKey:           pod.GetName(),
-					AWSTargetGroupSyncStatus: "false",
-				},
-				Annotations: map[string]string{
-					NlbARNAnnoKey:  lbARN,
-					NlbPortAnnoKey: fmt.Sprintf("%d", ports[i]),
-				},
+				Name:      targetGroupName,
+				Namespace: pod.GetNamespace(),
 			},
-			Spec: ackv1alpha1.TargetGroupSpec{
+		}
+		_, err := controllerutil.CreateOrUpdate(ctx, client, tg, func() error {
+			tg.OwnerReferences = ownerReference
+			tg.Labels = map[string]string{
+				ResourceTagKey:           ResourceTagValue,
+				SvcSelectorKey:           pod.GetName(),
+				AWSTargetGroupSyncStatus: "false",
+			}
+			tg.Annotations = map[string]string{
+				NlbARNAnnoKey:  lbARN,
+				NlbPortAnnoKey: fmt.Sprintf("%d", ports[i]),
+			}
+			tg.Spec = ackv1alpha1.TargetGroupSpec{
 				HealthCheckEnabled:         config.healthCheck.healthCheckEnabled,
 				HealthCheckIntervalSeconds: config.healthCheck.healthCheckIntervalSeconds,
 				HealthCheckPath:            config.healthCheck.healthCheckPath,
@@ -684,8 +729,9 @@ func (n *NlbPlugin) syncTargetGroupAndService(config *nlbConfig,
 				TargetType:                 &targetTypeIP,
 				Tags: []*ackv1alpha1.Tag{{Key: ptr.To[string](ResourceTagKey),
 					Value: ptr.To[string](ResourceTagValue)}},
-			},
-		}, func() error { return nil })
+			}
+			return nil
+		})
 		if err != nil {
 			return err
 		}
@@ -707,25 +753,26 @@ func (n *NlbPlugin) syncTargetGroupAndService(config *nlbConfig,
 	for key, value := range config.annotations {
 		annotations[key] = value
 	}
-	_, err := controllerutil.CreateOrUpdate(ctx, client, &corev1.Service{
+	svc := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:            pod.GetName(),
-			Namespace:       pod.GetNamespace(),
-			Annotations:     annotations,
-			OwnerReferences: ownerReference,
-			Labels: map[string]string{
-				ResourceTagKey: ResourceTagValue,
-				SvcSelectorKey: pod.GetName(),
-			},
+			Name:      pod.GetName(),
+			Namespace: pod.GetNamespace(),
 		},
-		Spec: corev1.ServiceSpec{
-			Type: corev1.ServiceTypeClusterIP,
-			Selector: map[string]string{
-				SvcSelectorKey: pod.GetName(),
-			},
-			Ports: svcPorts,
-		},
-	}, func() error { return nil })
+	}
+	_, err := controllerutil.CreateOrUpdate(ctx, client, svc, func() error {
+		svc.Annotations = annotations
+		svc.OwnerReferences = ownerReference
+		svc.Labels = map[string]string{
+			ResourceTagKey: ResourceTagValue,
+			SvcSelectorKey: pod.GetName(),
+		}
+		svc.Spec.Type = corev1.ServiceTypeClusterIP
+		svc.Spec.Selector = map[string]string{
+			SvcSelectorKey: pod.GetName(),
+		}
+		svc.Spec.Ports = svcPorts
+		return nil
+	})
 	if err != nil {
 		return err
 	}
